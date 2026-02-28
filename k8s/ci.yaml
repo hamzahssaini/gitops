@@ -1,0 +1,269 @@
+#  "بِسْمِ ٱللَّٰهِ ٱلرَّحْمَٰنِ ٱلرَّحِيمِ"
+# Pipeline GitLab CI/CD pour Snifly.Auth - Déploiement Azure App Service
+# Added:
+#  - DEPLOY_NUMBER (starts at 0) via artifacts:reports:dotenv
+#  - SonarQube quality gate stage
+#  - PreProd automatic deploy on main + Prod manual deploy
+#  - Teams notification on success
+
+stages:
+  - .pre
+  - build
+  - test
+  - quality
+  - publish
+  - deploy
+  - notify
+
+variables:
+  SOLUTION_PATH: "Snifly.Std/Snifly.Std.sln"
+  PROJECT_PATH: "Snifly.Std/Snifly.Std.API/Snifly.Std.API.csproj"
+  PUBLISH_DIR: "publish"
+  DOTNET_NOLOGO: "true"
+  DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+  NUGET_PACKAGES: "$CI_PROJECT_DIR/.nuget/packages"
+
+  # Message affiché dans les logs avant tout stage (modifiable via CI/CD Variables)
+  PIPELINE_ANNOUNCE_MSG: "بِسْمِ ٱللَّٰهِ ٱلرَّحْمَٰنِ ٱلرَّحِيمِ"
+
+  # Azure (set these in GitLab CI/CD Variables - masked/protected)
+  AZURE_SUBSCRIPTION_ID: ${AZURE_SUBSCRIPTION_ID}
+  AZURE_TENANT_ID: ${AZURE_TENANT_ID}
+  AZURE_CLIENT_ID: ${AZURE_CLIENT_ID}
+  AZURE_CLIENT_SECRET: ${AZURE_CLIENT_SECRET}
+  AZURE_RG: ${AZURE_RG} # Resource Group name for production
+  AZURE_WEBAPP_NAME: ${AZURE_WEBAPP_NAME} # App Service name for production
+
+  # Optional dev/preprod environment variables (set if you want separate names)
+  AZURE_RG_DEV: ${AZURE_RG_DEV}
+  AZURE_WEBAPP_NAME_DEV: ${AZURE_WEBAPP_NAME_DEV}
+  AZURE_RG_PREPROD: ${AZURE_RG_PREPROD}
+  AZURE_WEBAPP_NAME_PREPROD: ${AZURE_WEBAPP_NAME_PREPROD}
+
+  # SonarQube (set in CI/CD Variables)
+  SONAR_HOST_URL: ${SONAR_HOST_URL}
+  SONAR_TOKEN: ${SONAR_TOKEN}
+  SONAR_PROJECT_KEY: ${SONAR_PROJECT_KEY:-"snifly-project-key"}
+  SONAR_PROJECT_NAME: ${SONAR_PROJECT_NAME:-"Snifly.Std"}
+
+  # Teams webhook (set in CI/CD Variables; masked)
+  TEAMS_WEBHOOK: ${TEAMS_WEBHOOK}
+
+cache:
+  key: "$CI_COMMIT_REF_SLUG"
+  paths:
+    - .nuget/packages
+
+# --------------------------
+# Pre-step: announce & compute DEPLOY_NUMBER
+# --------------------------
+pre:announce:
+  stage: .pre
+  image: mcr.microsoft.com/dotnet/sdk:9.0
+  script:
+    - echo "${PIPELINE_ANNOUNCE_MSG:-Début du pipeline Snifly.Std}"
+    # Compute a deploy number starting at 0 (CI_PIPELINE_IID is 1-based per project)
+    - |
+      if [ -z "$CI_PIPELINE_IID" ]; then
+        DEPLOY_NUMBER=0
+      else
+        DEPLOY_NUMBER=$((CI_PIPELINE_IID - 1))
+      fi
+      echo "Computed DEPLOY_NUMBER=$DEPLOY_NUMBER"
+      echo "DEPLOY_NUMBER=$DEPLOY_NUMBER" > deploy_number.env
+  artifacts:
+    reports:
+      dotenv: deploy_number.env
+  rules:
+    - if: "$CI_PIPELINE_SOURCE" # run for any pipeline source (customize if needed)
+
+# --------------------------
+# Build
+# --------------------------
+build:dotnet:
+  stage: build
+  image: mcr.microsoft.com/dotnet/sdk:9.0
+  before_script:
+    - dotnet --info
+  script:
+    - dotnet restore "$SOLUTION_PATH"
+    - dotnet build "$SOLUTION_PATH" -c Release --no-restore
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: "$CI_COMMIT_BRANCH"
+
+# --------------------------
+# Test
+# --------------------------
+test:api:
+  stage: test
+  image: mcr.microsoft.com/dotnet/sdk:9.0
+  needs:
+    - job: build:dotnet
+  script:
+    - dotnet test "Snifly.Std/Snifly.Std.API.Test/Snifly.Std.API.Test.csproj" -c Release --no-build --logger "trx;LogFileName=test_results.trx"
+  artifacts:
+    when: always
+    paths:
+      - Snifly.Std/**/TestResults/*.trx
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: "$CI_COMMIT_BRANCH"
+
+# --------------------------
+# SonarQube Quality Stage
+# --------------------------
+sonarqube:analysis:
+  stage: quality
+  image: mcr.microsoft.com/dotnet/sdk:9.0
+  needs:
+    - job: build:dotnet
+    - job: test:api
+  variables:
+    DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+  before_script:
+    - export PATH="$PATH:$HOME/.dotnet/tools"
+    - dotnet --info
+  script:
+    - |
+      if [ -z "$SONAR_HOST_URL" ] || [ -z "$SONAR_TOKEN" ]; then
+        echo "ERROR: SONAR_HOST_URL and SONAR_TOKEN must be set as CI/CD variables"
+        exit 1
+      fi
+    # Install Sonar scanner for MSBuild if not already
+    - dotnet tool install --global dotnet-sonarscanner || true
+    - export PATH="$PATH:$HOME/.dotnet/tools"
+    # Begin Sonar analysis (wait for quality gate)
+    - dotnet sonarscanner begin /k:"$SONAR_PROJECT_KEY" /n:"$SONAR_PROJECT_NAME" /d:sonar.host.url="$SONAR_HOST_URL" /d:sonar.login="$SONAR_TOKEN" /d:sonar.qualitygate.wait=true
+    - dotnet build "$SOLUTION_PATH" -c Release
+    - dotnet sonarscanner end /d:sonar.login="$SONAR_TOKEN"
+  artifacts:
+    expire_in: 1 hour
+  rules:
+    - if: '$CI_COMMIT_BRANCH'  # run on branches — adjust rules to restrict to main/feature/MR
+
+# --------------------------
+# Publish (zip)
+# --------------------------
+publish:zip:
+  stage: publish
+  image: mcr.microsoft.com/dotnet/sdk:9.0
+  needs:
+    - job: build:dotnet
+    - job: test:api
+    - job: sonarqube:analysis
+  variables:
+    PUBLISH_DIR: publish
+  script:
+    - mkdir -p "$PUBLISH_DIR"
+    - dotnet publish "$PROJECT_PATH" -c Release -o "$PUBLISH_DIR"
+    - apt-get update
+    - apt-get install -y zip
+    - cd "$PUBLISH_DIR" && zip -r ../app.zip . && cd ..
+  artifacts:
+    paths:
+      - app.zip
+    expire_in: 1 week
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "develop"'
+
+# --------------------------
+# Deploy to PreProd (automatic on main)
+# --------------------------
+deploy:preprod:
+  stage: deploy
+  image: mcr.microsoft.com/azure-cli:latest
+  needs:
+    - job: publish:zip
+      artifacts: true
+  environment:
+    name: preprod
+    url: https://$AZURE_WEBAPP_NAME_PREPROD.azurewebsites.net
+  script:
+    - az --version
+    - az login --service-principal -u "$AZURE_CLIENT_ID" -p "$AZURE_CLIENT_SECRET" --tenant "$AZURE_TENANT_ID"
+    - az account set --subscription "$AZURE_SUBSCRIPTION_ID"
+    - |
+      # Use preprod variables if set, otherwise try dev variable as fallback
+      RG="${AZURE_RG_PREPROD:-$AZURE_RG_DEV}"
+      APP="${AZURE_WEBAPP_NAME_PREPROD:-$AZURE_WEBAPP_NAME_DEV}"
+      if [ -z "$RG" ] || [ -z "$APP" ]; then
+        echo "AZURE_RG_PREPROD/AZURE_WEBAPP_NAME_PREPROD (or dev fallback) must be set for preprod deploy" >&2
+        exit 1
+      fi
+      echo "DeployNumber: $DEPLOY_NUMBER"
+      echo "Deploying to PreProd: $APP in $RG"
+    - az webapp deploy --resource-group "$RG" --name "$APP" --src-path app.zip --type zip --async false
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      when: on_success
+    - when: never
+
+# --------------------------
+# Deploy to Prod (manual approval required)
+# --------------------------
+deploy:prod:
+  stage: deploy
+  image: mcr.microsoft.com/azure-cli:latest
+  needs:
+    - job: publish:zip
+      artifacts: true
+  environment:
+    name: production
+    url: https://$AZURE_WEBAPP_NAME.azurewebsites.net
+  script:
+    - az --version
+    - az login --service-principal -u "$AZURE_CLIENT_ID" -p "$AZURE_CLIENT_SECRET" --tenant "$AZURE_TENANT_ID"
+    - az account set --subscription "$AZURE_SUBSCRIPTION_ID"
+    - |
+      if [ -z "$AZURE_RG" ] || [ -z "$AZURE_WEBAPP_NAME" ]; then
+        echo "AZURE_RG and AZURE_WEBAPP_NAME must be set for prod deploy" >&2
+        exit 1
+      fi
+      echo "DeployNumber: $DEPLOY_NUMBER"
+      echo "Deploying to Production: $AZURE_WEBAPP_NAME in $AZURE_RG"
+    - az webapp deploy --resource-group "$AZURE_RG" --name "$AZURE_WEBAPP_NAME" --src-path app.zip --type zip --async false
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      when: manual
+    - when: never
+
+# --------------------------
+# Notify Team via Teams webhook (runs on success)
+# --------------------------
+notify:teams:
+  stage: notify
+  image: curlimages/curl:7.87.0
+  dependencies: []   # no need to download artifacts
+  script:
+    - |
+      if [ -z "$TEAMS_WEBHOOK" ]; then
+        echo "TEAMS_WEBHOOK not set. Skipping Teams notification."
+        exit 0
+      fi
+    - >
+      PAYLOAD=$(cat <<EOF
+      {
+        "@type": "MessageCard",
+        "@context": "http://schema.org/extensions",
+        "summary": "Pipeline Notification",
+        "themeColor": "0078D7",
+        "title": "Pipeline succeeded: ${CI_PROJECT_PATH}",
+        "sections": [
+          {
+            "activityTitle": "Pipeline #${CI_PIPELINE_IID} (Deploy #${DEPLOY_NUMBER:-n/a})",
+            "facts": [
+              { "name": "Project", "value": "${CI_PROJECT_PATH}" },
+              { "name": "Branch", "value": "${CI_COMMIT_BRANCH}" },
+              { "name": "Commit", "value": "${CI_COMMIT_SHORT_SHA}" }
+            ],
+            "markdown": true
+          }
+        ]
+      }
+      EOF
+      )
+    - echo "$PAYLOAD" | curl -s -H "Content-Type: application/json" -d @- "$TEAMS_WEBHOOK" || true
+  rules:
+    - if: '$CI_PIPELINE_SOURCE'  # run for any pipeline source; customize if you want only main/develop
+      when: on_success
