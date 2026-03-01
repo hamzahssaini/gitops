@@ -2,7 +2,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: hamza-app
-  namespace: test
+  namespace: hamza-project
 spec:
   replicas: 2
   selector:
@@ -36,8 +36,6 @@ spec:
                 secretKeyRef:
                   name: hamza-secret
                   key: MONGO_PASSWORD
-            - name: MONGO_URI
-              value: mongodb://$(MONGO_USERNAME):$(MONGO_PASSWORD)@mongo-service.hamza-project.svc.cluster.local:27017/hamza_db?authSource=admin
           readinessProbe:
             httpGet:
               path: /healthz
